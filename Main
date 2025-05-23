@@ -1,0 +1,206 @@
+# Importing the necessary libraries
+import cv2                  # Used for camera and image processing
+import RPi.GPIO as GPIO     # Controls the GPIO pins on Raspberry Pi
+import time                 # Adds delays in seconds
+import socket               # Lets the Pi communicate over a network
+
+# === Define Motor and Buzzer Pin Numbers ===
+
+# Motor driver 1 (Top motors)
+TOP_LEFT_IN1 = 17
+TOP_LEFT_IN2 = 18
+TOP_LEFT_EN = 4
+
+TOP_RIGHT_IN3 = 22
+TOP_RIGHT_IN4 = 23
+TOP_RIGHT_EN = 25
+
+# Motor driver 2 (Bottom motors)
+BOT_LEFT_IN1 = 5
+BOT_LEFT_IN2 = 6
+BOT_LEFT_EN = 13
+
+BOT_RIGHT_IN3 = 19
+BOT_RIGHT_IN4 = 26
+BOT_RIGHT_EN = 12
+
+# Buzzer pin
+BUZZER = 24
+
+# List of all pins used for motors and buzzer
+motor_pins = [
+    TOP_LEFT_IN1, TOP_LEFT_IN2, TOP_LEFT_EN,
+    TOP_RIGHT_IN3, TOP_RIGHT_IN4, TOP_RIGHT_EN,
+    BOT_LEFT_IN1, BOT_LEFT_IN2, BOT_LEFT_EN,
+    BOT_RIGHT_IN3, BOT_RIGHT_IN4, BOT_RIGHT_EN,
+    BUZZER
+]
+
+# Set how we refer to GPIO pin numbers (BCM means using GPIO numbers, not pin numbers)
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)  # Turn off warning messages
+
+# Set each pin to OUTPUT mode
+for pin in motor_pins:
+    GPIO.setup(pin, GPIO.OUT)
+    if pin == BUZZER:
+        GPIO.output(pin, GPIO.HIGH)  # Turn off the buzzer at the beginning (active LOW logic)
+
+# === Set up PWM (motor speed control) ===
+
+PWM_FREQ = 100  # Frequency for PWM (how fast signals turn on/off)
+
+# Create PWM objects for each motor enable pin
+top_left_pwm = GPIO.PWM(TOP_LEFT_EN, PWM_FREQ)
+top_right_pwm = GPIO.PWM(TOP_RIGHT_EN, PWM_FREQ)
+bot_left_pwm = GPIO.PWM(BOT_LEFT_EN, PWM_FREQ)
+bot_right_pwm = GPIO.PWM(BOT_RIGHT_EN, PWM_FREQ)
+
+# Start all motors with 0 speed (stopped)
+for pwm in [top_left_pwm, top_right_pwm, bot_left_pwm, bot_right_pwm]:
+    pwm.start(0)
+
+# === Functions to Move the Robot ===
+
+def set_motor_state(left_fwd, left_bwd, right_fwd, right_bwd, speed=60):
+    """
+    Set which motors should go forward or backward and how fast.
+    """
+    # Top motors
+    GPIO.output(TOP_LEFT_IN1, left_fwd)
+    GPIO.output(TOP_LEFT_IN2, left_bwd)
+    GPIO.output(TOP_RIGHT_IN3, right_fwd)
+    GPIO.output(TOP_RIGHT_IN4, right_bwd)
+    top_left_pwm.ChangeDutyCycle(speed)
+    top_right_pwm.ChangeDutyCycle(speed)
+
+    # Bottom motors
+    GPIO.output(BOT_LEFT_IN1, left_fwd)
+    GPIO.output(BOT_LEFT_IN2, left_bwd)
+    GPIO.output(BOT_RIGHT_IN3, right_fwd)
+    GPIO.output(BOT_RIGHT_IN4, right_bwd)
+    bot_left_pwm.ChangeDutyCycle(speed)
+    bot_right_pwm.ChangeDutyCycle(speed)
+
+def move_forward(duration=2):
+    # Move forward for a few seconds
+    set_motor_state(True, False, True, False)
+    time.sleep(duration)
+    stop_motors()
+
+def move_backward(duration=2):
+    # Move backward for a few seconds
+    set_motor_state(False, True, False, True)
+    time.sleep(duration)
+    stop_motors()
+
+def turn_left(duration=2):
+    # Turn left by rotating motors in opposite directions
+    set_motor_state(False, True, True, False)
+    time.sleep(duration)
+    stop_motors()
+
+def turn_right(duration=2):
+    # Turn right by rotating motors in opposite directions
+    set_motor_state(True, False, False, True)
+    time.sleep(duration)
+    stop_motors()
+
+def stop_motors():
+    # Stop all motors
+    set_motor_state(False, False, False, False, speed=0)
+
+def buzz(duration=1):
+    # Turn on the buzzer (active LOW), wait, then turn it off
+    GPIO.output(BUZZER, GPIO.LOW)
+    time.sleep(duration)
+    GPIO.output(BUZZER, GPIO.HIGH)
+
+# === Camera Setup ===
+cap = cv2.VideoCapture(0)  # Start the webcam (camera #0)
+
+# === TCP Server Setup for Remote Control ===
+HOST = '0.0.0.0'     # Listen to all network interfaces
+PORT = 12345         # Port number to use for communication
+
+# Create a server socket and allow quick restart
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((HOST, PORT))
+server.listen(1)
+print(f"[TCP Server] Listening on {HOST}:{PORT}")
+
+# Wait for a client (like a laptop or phone) to connect
+conn, addr = server.accept()
+print(f"[Connected] {addr}")
+
+try:
+    while True:
+        # === Check Camera for Red Object ===
+        ret, frame = cap.read()  # Read one frame from the camera
+        if not ret:
+            break  # If camera fails, stop the program
+
+        # Convert image from BGR to HSV color space
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Define HSV range for red color
+        lower_red = (0, 100, 100)
+        upper_red = (10, 255, 255)
+
+        # Create a mask that includes only red parts
+        mask = cv2.inRange(hsv, lower_red, upper_red)
+
+        # Find shapes in the red area
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        red_detected = False  # Assume no red by default
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > 500:  # Ignore small red spots
+                red_detected = True
+                x, y, w, h = cv2.boundingRect(cnt)
+                # Draw green box around red object
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                break  # Stop after first large red object
+
+        if red_detected:
+            # If red object is seen, stop and beep!
+            stop_motors()
+            buzz(0.5)
+            print("Red object detected! Stopping.")
+
+        # === Check for Commands Over the Network ===
+        conn.settimeout(0.01)  # Don't wait too long for message
+        try:
+            command = conn.recv(1024).decode('utf-8').strip()  # Get command text
+            if command:
+                print(f"[Command] {command}")
+                if command == 'F':
+                    move_forward()
+                elif command == 'B':
+                    move_backward()
+                elif command == 'L':
+                    turn_left()
+                elif command == 'R':
+                    turn_right()
+                elif command == 'S':
+                    stop_motors()
+        except socket.timeout:
+            pass  # No command received this time
+
+        # Show the camera image in a window
+        cv2.imshow("Camera", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break  # Press 'q' to quit
+
+except KeyboardInterrupt:
+    # If you press Ctrl+C, safely shut down
+    pass
+finally:
+    # Clean everything up when you're done
+    cap.release()          # Turn off the camera
+    cv2.destroyAllWindows()  # Close the image window
+    conn.close()           # Close the connection
+    server.close()         # Close the server
+    GPIO.cleanup()         # Turn off all GPIO pins
